@@ -1,0 +1,918 @@
+
+/* v3: Robust music loading (tries underscore + space names), on-screen audio status + test button. */
+
+const canvas = document.getElementById("c");
+const ctx = canvas.getContext("2d");
+
+// ---------- fullscreen canvas ----------
+function resizeCanvas(){
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.floor(window.innerWidth * dpr);
+  const h = Math.floor(window.innerHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h){
+    canvas.width = w;
+    canvas.height = h;
+    // keep circle in bounds
+    state.circle.x = clamp(state.circle.x, 0, canvas.width);
+    state.circle.y = clamp(state.circle.y, 0, canvas.height);
+  }
+}
+addEventListener("resize", resizeCanvas);
+
+// ---------- helpers ----------
+function clamp(v,a,b){ return Math.max(a, Math.min(b, v)); }
+
+function freeEssence(){ return Math.max(0, save.essenceTotal - save.essenceBound); }
+function karmaLevel(){ return save.karma; }
+function rand(a,b){ return a + Math.random()*(b-a); }
+function dist2(ax,ay,bx,by){ const dx=ax-bx, dy=ay-by; return dx*dx+dy*dy; }
+function lerp(a,b,t){ return a+(b-a)*t; }
+function urlRel(p){ return new URL(p, window.location.href).toString(); }
+
+// ---------- persistence ----------
+const SAVE_KEY = "sigil_proto_save_v3";
+const SETTINGS_KEY = "sigil_proto_settings_v3";
+
+function defaultSave(){
+  return {
+    round: 1,
+    bankSouls: 0,
+    upgrades: { radius:1, bind:1, pull:0, stability:0, essence:1 }
+  };
+}
+function loadSave(){
+  try{
+    const raw = localStorage.getItem(SAVE_KEY);
+    if(!raw) return defaultSave();
+    const s = JSON.parse(raw);
+    return { ...defaultSave(), ...s, upgrades: { ...defaultSave().upgrades, ...(s.upgrades||{}) } };
+  }catch{ return defaultSave(); }
+}
+function saveNow(){ localStorage.setItem(SAVE_KEY, JSON.stringify(save)); }
+
+function defaultSettings(){
+  return { musicVolume:0.55, sfxVolume:0.75, musicEnabled:true, sfxEnabled:true, muteAll:false };
+}
+function loadSettings(){
+  try{
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if(!raw) return defaultSettings();
+    const s = JSON.parse(raw);
+    return { ...defaultSettings(), ...s };
+  }catch{ return defaultSettings(); }
+}
+function saveSettingsNow(){ localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); }
+
+let save = loadSave();
+let settings = loadSettings();
+
+// ---------- audio ----------
+let audioCtx = null;
+function ensureAudioCtx(){
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === "suspended") audioCtx.resume().catch(()=>{});
+}
+function beep({freq=440, dur=0.07, gain=0.08, type="sine"} = {}){
+  if (!settings.sfxEnabled || settings.muteAll) return;
+  try{
+    ensureAudioCtx();
+    const t0 = audioCtx.currentTime;
+    const osc = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t0);
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(Math.max(0.0002, gain * settings.sfxVolume), t0 + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(g).connect(audioCtx.destination);
+    osc.start(t0); osc.stop(t0 + dur + 0.02);
+  }catch{}
+}
+const sfx = {
+  click: ()=>beep({freq:520, dur:0.05, gain:0.07, type:"square"}),
+  collect: ()=>beep({freq:840, dur:0.05, gain:0.06, type:"sine"}),
+  unworthy: ()=>beep({freq:110, dur:0.12, gain:0.10, type:"triangle"})
+};
+
+// Music: try both naming variants to avoid Opera file path mismatch issues
+const MUSIC_CANDIDATES = {
+  menu: ["audio/menu_theme.mp3", "audio/menu theme.mp3"],
+  round: ["audio/round_loop.mp3", "audio/round loop.mp3"]
+};
+
+function makeAudio(){
+  const a = new Audio();
+  a.preload = "auto";
+  a.loop = true;
+  return a;
+}
+
+const audio = { menu: makeAudio(), round: makeAudio() };
+
+async function trySetSource(aud, candidates){
+  // Try in order until metadata loads
+  for (const p of candidates){
+    const src = urlRel(p);
+    const ok = await new Promise((resolve)=>{
+      const onOk = ()=>{ cleanup(); resolve(true); };
+      const onErr = ()=>{ cleanup(); resolve(false); };
+      const cleanup = ()=>{
+        aud.removeEventListener("loadedmetadata", onOk);
+        aud.removeEventListener("canplaythrough", onOk);
+        aud.removeEventListener("error", onErr);
+      };
+      aud.addEventListener("loadedmetadata", onOk, { once:true });
+      aud.addEventListener("canplaythrough", onOk, { once:true });
+      aud.addEventListener("error", onErr, { once:true });
+      aud.src = src;
+      aud.load();
+      // safety timeout
+      setTimeout(()=>{ cleanup(); resolve(false); }, 1200);
+    });
+    if (ok) return { ok:true, src };
+  }
+  return { ok:false, src: candidates[0] };
+}
+
+const audioStatus = { menu:"", round:"", unlocked:false };
+
+function applyAudioSettings(){
+  const muted = settings.muteAll || !settings.musicEnabled;
+  audio.menu.muted = muted;
+  audio.round.muted = muted;
+  audio.menu.volume = clamp(settings.musicVolume, 0, 1) * 0.75;
+  audio.round.volume = clamp(settings.musicVolume, 0, 1) * 0.60;
+}
+applyAudioSettings();
+
+async function initMusicSources(){
+  const m = await trySetSource(audio.menu, MUSIC_CANDIDATES.menu);
+  audioStatus.menu = m.ok ? "OK" : "FEHLT (Pfad/Name)";
+  const r = await trySetSource(audio.round, MUSIC_CANDIDATES.round);
+  audioStatus.round = r.ok ? "OK" : "FEHLT (Pfad/Name)";
+}
+initMusicSources();
+
+function playMenuMusic(){
+  if (!settings.musicEnabled || settings.muteAll) return;
+  if (audio.menu.paused) audio.menu.currentTime = 0;
+  audio.menu.play().catch(()=>{});
+}
+function stopMenuMusic(){ audio.menu.pause(); audio.menu.currentTime = 0; }
+
+function playRoundMusic(){
+  if (!settings.musicEnabled || settings.muteAll) return;
+  audio.round.play().catch(()=>{});
+}
+function stopRoundMusic(){ audio.round.pause(); audio.round.currentTime = 0; }
+
+function fadeInRoundMusic(duration=0.8){
+  if (!settings.musicEnabled || settings.muteAll) return;
+  const target = clamp(settings.musicVolume, 0, 1) * 0.60;
+  audio.round.volume = 0;
+  audio.round.play().catch(()=>{});
+  const t0 = performance.now();
+  function step(t){
+    const p = Math.min(1, (t-t0)/(duration*1000));
+    audio.round.volume = target * p;
+    if (p < 1 && !audio.round.paused) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+function fadeOutRoundMusic(duration=0.6){
+  const start = audio.round.volume;
+  const t0 = performance.now();
+  function step(t){
+    const p = Math.min(1, (t-t0)/(duration*1000));
+    audio.round.volume = start * (1-p);
+    if (p < 1 && !audio.round.paused) requestAnimationFrame(step);
+    else stopRoundMusic();
+  }
+  requestAnimationFrame(step);
+}
+function fadeOutMenuMusic(duration=0.7){
+  const start = audio.menu.volume;
+  const t0 = performance.now();
+  function step(t){
+    const p = Math.min(1, (t-t0)/(duration*1000));
+    audio.menu.volume = start * (1-p);
+    if (p < 1 && !audio.menu.paused) requestAnimationFrame(step);
+    else { stopMenuMusic(); applyAudioSettings(); }
+  }
+  requestAnimationFrame(step);
+}
+
+function unlockAudio(){
+  audioStatus.unlocked = true;
+  ensureAudioCtx();
+  if (state.screen === "MENU") playMenuMusic();
+  if (state.screen === "GAME") playRoundMusic();
+}
+addEventListener("pointerdown", unlockAudio, { once:true });
+addEventListener("keydown", unlockAudio, { once:true });
+
+// ---------- input ----------
+const keys = new Set();
+addEventListener("keydown", e => {
+  keys.add(e.key);
+  if (e.key === "Escape") toggleMenu();
+  if (e.key.toLowerCase() === "r") resetAll();
+});
+addEventListener("keyup", e => keys.delete(e.key));
+
+// ---------- orbs ----------
+const ORB_TYPES = {
+  common: { value:1, bindMult:1.0, color:"#e6e0d6" },
+  blue:   { value:5, bindMult:1.4, color:"#7aa8ff" },
+  red:    { value:20, bindMult:1.9, color:"#ff6b6b" },
+  mythic: { value:100, bindMult:2.4, color:"#141018" }
+};
+function rollOrbType(){
+  const r = Math.random();
+  if (r < 0.78) return "common";
+  if (r < 0.93) return "blue";
+  if (r < 0.99) return "red";
+  return "mythic";
+}
+function canBind(type){ return type !== "mythic" ? true : (save.upgrades.essence >= 2); }
+
+// ---------- state ----------
+const state = {
+  screen:"MENU", // MENU | OPTIONS | GAME
+  phase:"ROUND", // ROUND | UPGRADE
+  roundDuration:30.0,
+  timeLeft:30.0,
+  soulsThisRound:0,
+  souls:[],
+  spawnRateBase:1.9,
+  spawnAcc:0,
+  circle:{ x:canvas.width*0.5, y:canvas.height*0.55, speed:260, vx:0, vy:0 },
+  unworthyCount:0,
+  bindPenaltyT:0,
+  ui:{
+    flashT:0, toastText:"", toastT:0, toastX:0, toastY:0, msg:"" }
+};
+
+// ---------- SPACE RITUAL (preview) ----------
+let innocents = [];
+let ritualCd = 0;
+function spawnInnocent(){
+  const edge = Math.floor(Math.random()*4);
+  let x=0,y=0;
+  if(edge===0){ x=Math.random()*canvas.width; y=0; }
+  if(edge===1){ x=canvas.width; y=Math.random()*canvas.height; }
+  if(edge===2){ x=Math.random()*canvas.width; y=canvas.height; }
+  if(edge===3){ x=0; y=Math.random()*canvas.height; }
+  innocents.push({ x,y, vx:(Math.random()-0.5)*90, vy:(Math.random()-0.5)*90, t:0 });
+}
+function triggerRitual(){
+  if(state.screen!=="GAME" || state.phase!=="ROUND") return;
+  if(ritualCd>0) return;
+  ritualCd = 18; // sec
+  state.ui.flashT = 0.65;
+  const n = 3 + Math.floor(Math.random()*3);
+  for(let i=0;i<n;i++) spawnInnocent();
+}
+
+
+// derived stats
+function radiusPx(){ return 44 + (save.upgrades.radius-1)*10; }
+function bindTime(){
+  const base=1.30, step=0.16, minT=0.20;
+  return Math.max(minT, base - (save.upgrades.bind-1)*step);
+}
+function pullStrength(){ return save.upgrades.pull * 0.20; }
+function stability(){ return save.upgrades.stability * 0.18; }
+function spawnRate(){ return state.spawnRateBase + (save.round-1)*0.20; }
+
+// toast/escalation
+function showToast(text){
+  state.ui.toastText = text;
+  state.ui.toastT = 0.75;
+  state.ui.toastX = state.circle.x;
+  state.ui.toastY = state.circle.y - (radiusPx()+22);
+}
+function unworthyReaction(){
+  state.unworthyCount++;
+  sfx.unworthy();
+  if (state.unworthyCount===1) showToast("NICHT WÜRDIG");
+  else if (state.unworthyCount===2) showToast("DER KREIS VERWEIGERT DICH");
+  else if (state.unworthyCount===3){ showToast("DAS SIEGEL ERKENNT DICH NICHT"); state.bindPenaltyT = Math.max(state.bindPenaltyT, 0.5); }
+  else { showToast("DU SOLLTEST NICHT HIER SEIN"); state.bindPenaltyT = Math.max(state.bindPenaltyT, 1.5); }
+}
+
+// souls
+function spawnSoul(){
+  const side = (Math.random()*4)|0;
+  let x,y;
+  if(side===0){ x=rand(0,canvas.width); y=-30; }
+  if(side===1){ x=canvas.width+30; y=rand(0,canvas.height); }
+  if(side===2){ x=rand(0,canvas.width); y=canvas.height+30; }
+  if(side===3){ x=-30; y=rand(0,canvas.height); }
+
+  const cx = rand(120, canvas.width-120);
+  const cy = rand(120, canvas.height-120);
+  const type = rollOrbType();
+  state.souls.push({ x,y, r:6, cx,cy, orbitR:rand(70,190), angle:rand(0,Math.PI*2), angVel:rand(-2.1,2.1),
+    drift:{x:rand(-26,26), y:rand(-26,26)}, type, bound:0, weakPulse:0, dead:false });
+}
+
+// upgrades
+function costRadiusNext(){ const lvl=save.upgrades.radius; return Math.floor(18+(lvl-1)*18); }
+function costBindNext(){ const lvl=save.upgrades.bind; return Math.floor(16+(lvl-1)*16); }
+function costPullNext(){ const lvl=save.upgrades.pull; return Math.floor(24+(lvl)*22); }
+function costStabilityNext(){ const lvl=save.upgrades.stability; return Math.floor(22+(lvl)*20); }
+function costEssenceNext(){ const lvl=save.upgrades.essence; return Math.floor(60+(lvl-1)*90); }
+function buyUpgrade(key, cost){
+  if (save.bankSouls < cost){ state.ui.msg="Nicht genug Seelen."; return; }
+  save.bankSouls -= cost;
+  save.upgrades[key] += 1;
+  if (key==="essence"){ state.unworthyCount=0; state.bindPenaltyT=0; }
+  state.ui.msg="Siegel verstärkt.";
+  saveNow();
+}
+
+// UI buttons
+const uiButtons = [];
+let uiHover = null;
+function setButtons(btns){ uiButtons.length=0; btns.forEach(b=>uiButtons.push(b)); }
+function uiHitTest(mx,my){ return uiButtons.find(b => mx>=b.x&&mx<=b.x+b.w&&my>=b.y&&my<=b.y+b.h) || null; }
+function pointerToCanvas(e){
+  const rect = canvas.getBoundingClientRect();
+  return { mx:(e.clientX-rect.left)*(canvas.width/rect.width), my:(e.clientY-rect.top)*(canvas.height/rect.height) };
+}
+canvas.addEventListener("mousemove",(e)=>{ const {mx,my}=pointerToCanvas(e); uiHover = uiHitTest(mx,my)?.id || null; });
+canvas.addEventListener("click",(e)=>{
+  const {mx,my}=pointerToCanvas(e);
+  const b = uiHitTest(mx,my);
+  if(!b) return;
+  sfx.click();
+  b.onClick?.();
+});
+
+// node click for pentagram upgrades
+canvas.addEventListener("click",(e)=>{
+  if(!(state.screen==="GAME" && state.phase==="UPGRADE")) return;
+  const {mx,my}=pointerToCanvas(e);
+  for(const n of treeHit){
+    if(dist2(mx,my,n.x,n.y) <= n.r*n.r){
+      buyUpgrade(n.key, n.cost);
+      return;
+    }
+  }
+});
+
+function buildMenuButtons(){
+  const cx=canvas.width/2, top=canvas.height/2-10, w=340, h=44, gap=14;
+  setButtons([
+    {id:"start", x:cx-w/2, y:top, w,h, label:"BEGINN", onClick:()=>startNewRun()},
+    {id:"options", x:cx-w/2, y:top+(h+gap), w,h, label:"OPTIONEN", onClick:()=>goOptions()},    {id:"reset", x:cx-w/2, y:top+3*(h+gap), w,h, label:"RESET", onClick:()=>resetAll()},
+  ]);
+}
+function buildOptionsButtons(){
+  const cx=canvas.width/2, left=cx-220, top=canvas.height/2-90, rowH=52, w=440;
+  setButtons([
+    {id:"mv_dn", x:left, y:top, w:50,h:36, label:"-", onClick:()=>{ settings.musicVolume=clamp(settings.musicVolume-0.05,0,1); applyAudioSettings(); saveSettingsNow(); }},
+    {id:"mv_up", x:left+w-50,y:top, w:50,h:36, label:"+", onClick:()=>{ settings.musicVolume=clamp(settings.musicVolume+0.05,0,1); applyAudioSettings(); saveSettingsNow(); }},
+    {id:"sv_dn", x:left, y:top+rowH, w:50,h:36, label:"-", onClick:()=>{ settings.sfxVolume=clamp(settings.sfxVolume-0.05,0,1); saveSettingsNow(); sfx.click(); }},
+    {id:"sv_up", x:left+w-50,y:top+rowH, w:50,h:36, label:"+", onClick:()=>{ settings.sfxVolume=clamp(settings.sfxVolume+0.05,0,1); saveSettingsNow(); sfx.collect(); }},
+    {id:"music_toggle", x:left, y:top+2*rowH, w, h:40, label:"MUSIK AN/AUS", onClick:()=>{ settings.musicEnabled=!settings.musicEnabled; applyAudioSettings(); saveSettingsNow(); if(!settings.musicEnabled){ stopMenuMusic(); stopRoundMusic(); } }},
+    {id:"sfx_toggle", x:left, y:top+2*rowH+50, w, h:40, label:"SFX AN/AUS", onClick:()=>{ settings.sfxEnabled=!settings.sfxEnabled; saveSettingsNow(); sfx.click(); }},
+    {id:"mute", x:left, y:top+2*rowH+100, w, h:40, label:"MUTE ALLES", onClick:()=>{ settings.muteAll=!settings.muteAll; applyAudioSettings(); saveSettingsNow(); if(settings.muteAll){ stopMenuMusic(); stopRoundMusic(); } }},
+    {id:"back", x:cx-160, y:top+2*rowH+160, w:320,h:44, label:"ZURÜCK", onClick:()=>goMenu()},
+  ]);
+}
+
+function buildUpgradeButtons(){
+  const cx=canvas.width/2, by=canvas.height*0.78, w=360, h=44, gap=14;
+  setButtons([
+    {id:"next", x:cx-w/2, y:by, w,h, label:"NÄCHSTE RUNDE", onClick:()=>nextRound()},
+    {id:"menu", x:cx-w/2, y:by+(h+gap), w,h, label:"ZUM MENÜ", onClick:()=>goMenu()},
+  ]);
+}
+
+// --- pentagram nodes ---
+const tree = {
+  nodes: [
+    {key:"radius", name:"RADIUS", costFn:costRadiusNext},
+    {key:"bind", name:"BINDUNG", costFn:costBindNext},
+    {key:"pull", name:"ANZIEHUNG", costFn:costPullNext},
+    {key:"stability", name:"STABILITÄT", costFn:costStabilityNext},
+    {key:"essence", name:"ESSENZ", costFn:costEssenceNext},
+  ]
+};
+let treeHit = [];
+
+function drawPentagramTree(cx, cy, R){
+  const pts=[];
+  for(let i=0;i<5;i++){
+    const a = (i/5)*Math.PI*2 - Math.PI/2;
+    pts.push({x: cx + Math.cos(a)*R, y: cy + Math.sin(a)*R});
+  }
+
+  // outer
+  ctx.strokeStyle="rgba(230,224,214,0.18)";
+  ctx.lineWidth=2;
+  ctx.beginPath();
+  for(let i=0;i<5;i++){ const p=pts[i]; if(i===0) ctx.moveTo(p.x,p.y); else ctx.lineTo(p.x,p.y); }
+  ctx.closePath(); ctx.stroke();
+
+  // star
+  const order=[0,2,4,1,3,0];
+  ctx.strokeStyle="rgba(230,224,214,0.14)";
+  ctx.beginPath();
+  for(let i=0;i<order.length;i++){ const p=pts[order[i]]; if(i===0) ctx.moveTo(p.x,p.y); else ctx.lineTo(p.x,p.y); }
+  ctx.stroke();
+
+  treeHit = [];
+  for(let i=0;i<5;i++){
+    const node = tree.nodes[i];
+    const p = pts[i];
+    const cost = node.costFn();
+    const can = save.bankSouls >= cost;
+
+    ctx.fillStyle = can ? "rgba(230,224,214,0.10)" : "rgba(230,224,214,0.05)";
+    ctx.strokeStyle = can ? "rgba(230,224,214,0.34)" : "rgba(230,224,214,0.18)";
+    ctx.lineWidth=2;
+    ctx.beginPath(); ctx.arc(p.x,p.y,22,0,Math.PI*2); ctx.fill(); ctx.stroke();
+
+    ctx.fillStyle="#e6e0d6"; ctx.globalAlpha=0.88;
+    ctx.font="12px ui-monospace, monospace";
+    const txt = node.name;
+    ctx.fillText(txt, p.x-ctx.measureText(txt).width/2, p.y-30);
+
+    const c = `-${cost}`;
+    ctx.globalAlpha = can ? 0.70 : 0.40;
+    ctx.fillText(c, p.x-ctx.measureText(c).width/2, p.y+42);
+    ctx.globalAlpha=1;
+
+    treeHit.push({x:p.x,y:p.y,r:28,key:node.key,cost});
+  }
+
+  // center dot
+  ctx.fillStyle="rgba(197,140,255,0.06)";
+  ctx.beginPath(); ctx.arc(cx,cy,4,0,Math.PI*2); ctx.fill();
+}
+
+
+// screens
+function goMenu(){
+  state.screen="MENU"; state.phase="ROUND";
+  buildMenuButtons();
+  stopRoundMusic();
+  playMenuMusic();
+}
+function goOptions(){ state.screen="OPTIONS"; buildOptionsButtons(); }
+function startNewRun(){
+  state.screen="GAME"; state.phase="ROUND";
+  state.timeLeft=state.roundDuration;
+  state.soulsThisRound=0; state.souls=[]; state.spawnAcc=0; state.ui.msg="";
+  state.unworthyCount=0; state.bindPenaltyT=0;
+  fadeOutMenuMusic(0.6);
+  fadeInRoundMusic(0.9);
+}
+function toggleMenu(){ if(state.screen==="MENU") startNewRun(); else goMenu(); }
+
+function endRound(){
+  state.phase="UPGRADE";
+  buildUpgradeButtons();
+  state.timeLeft=0;
+  fadeOutRoundMusic(0.6);
+  state.unworthyCount=0; state.bindPenaltyT=0;
+  saveNow();
+}
+function nextRound(){
+  save.round += 1;
+  state.phase="ROUND";
+  state.timeLeft=state.roundDuration;
+  state.soulsThisRound=0; state.souls=[]; state.spawnAcc=0; state.ui.msg="";
+  state.unworthyCount=0; state.bindPenaltyT=0;
+  saveNow();
+  fadeInRoundMusic(0.6);
+}
+function resetAll(){
+  localStorage.removeItem(SAVE_KEY);
+  save = defaultSave();
+  saveNow();
+  goMenu();
+}
+
+// update
+function updateRound(dt){
+  // weighted movement (ritual feel) — WASD + Arrows
+  const accel = 520;
+  const drag = 5.2;
+
+  let ax=0, ay=0;
+  if(keys.has("a")||keys.has("ArrowLeft")) ax-=1;
+  if(keys.has("d")||keys.has("ArrowRight")) ax+=1;
+  if(keys.has("w")||keys.has("ArrowUp")) ay-=1;
+  if(keys.has("s")||keys.has("ArrowDown")) ay+=1;
+
+  // normalize input for diagonals
+  const l=Math.hypot(ax,ay) || 1;
+  ax/=l; ay/=l;
+
+  state.circle.vx += ax*accel*dt;
+  state.circle.vy += ay*accel*dt;
+
+  // drag (stabilizes quickly but keeps weight)
+  state.circle.vx -= state.circle.vx*drag*dt;
+  state.circle.vy -= state.circle.vy*drag*dt;
+
+  state.circle.x = clamp(state.circle.x + state.circle.vx*dt, 0, canvas.width);
+  state.circle.y = clamp(state.circle.y + state.circle.vy*dt, 0, canvas.height);
+
+  state.spawnAcc += dt * spawnRate();
+  while(state.spawnAcc >= 1){ state.spawnAcc -= 1; spawnSoul(); }
+
+  if(state.ui.toastT>0) state.ui.toastT=Math.max(0, state.ui.toastT-dt);
+  if(state.bindPenaltyT>0) state.bindPenaltyT=Math.max(0, state.bindPenaltyT-dt);
+
+  const R=radiusPx(), R2=R*R;
+  const baseBindT=bindTime();
+  const pull=pullStrength();
+  const stab=stability();
+
+  for(const s of state.souls){
+    if(s.dead) continue;
+
+    s.angle += s.angVel*dt;
+    const tx=s.cx + Math.cos(s.angle)*s.orbitR;
+    const ty=s.cy + Math.sin(s.angle)*s.orbitR;
+
+    s.x += (tx - s.x)*(0.65*dt) + s.drift.x*dt;
+    s.y += (ty - s.y)*(0.65*dt) + s.drift.y*dt;
+
+    if(s.x<-50) s.x=canvas.width+50;
+    if(s.x>canvas.width+50) s.x=-50;
+    if(s.y<-50) s.y=canvas.height+50;
+    if(s.y>canvas.height+50) s.y=-50;
+
+    const inside = dist2(s.x,s.y,state.circle.x,state.circle.y) <= R2;
+
+    if(pull>0){
+      const d2=dist2(s.x,s.y,state.circle.x,state.circle.y);
+      const influence = (R*R*2.2);
+      if(d2<influence){
+        const d=Math.sqrt(d2)||1;
+        const ux=(state.circle.x - s.x)/d;
+        const uy=(state.circle.y - s.y)/d;
+        s.x += ux*pull*45*dt;
+        s.y += uy*pull*45*dt;
+      }
+    }
+
+    if(s.weakPulse>0) s.weakPulse=Math.max(0, s.weakPulse-dt);
+
+    const t=ORB_TYPES[s.type];
+    let bindT = baseBindT * t.bindMult + (state.bindPenaltyT>0 ? 0.4 : 0);
+
+    if(inside){
+      if(!canBind(s.type)){
+        s.bound=0; s.weakPulse=0.18;
+        if(state.ui.toastT <= 0.05) unworthyReaction();
+      } else {
+        s.bound += dt;
+        if(s.bound >= bindT){
+          s.dead = true;
+          state.soulsThisRound += t.value;
+          save.bankSouls += t.value;
+          state.ui.msg = `+${t.value}`;
+          sfx.collect();
+        }
+      }
+    } else {
+      const loss = lerp(0.95, 0.35, clamp(stab,0,0.7));
+      s.bound = Math.max(0, s.bound - dt*loss);
+    }
+  }
+
+  state.timeLeft -= dt;
+  if(state.timeLeft <= 0){ state.timeLeft=0; endRound(); }
+
+  if(state.souls.length > 260){
+    state.souls = state.souls.filter(s=>!s.dead).slice(-220);
+  }
+}
+function update(dt){
+  if(state.screen==="GAME"){
+    if(state.phase==="ROUND") updateRound(dt);
+    else if(state.ui.toastT>0) state.ui.toastT=Math.max(0, state.ui.toastT-dt);
+  }
+}
+
+// drawing
+function drawBackground(){
+  ctx.fillStyle="#050507";
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.globalAlpha=0.08;
+  for(let i=0;i<120;i++) ctx.fillRect(Math.random()*canvas.width, Math.random()*canvas.height, 1, 1);
+  ctx.globalAlpha=1;
+}
+function drawButton(b){
+  const hovered = (uiHover===b.id);
+  ctx.fillStyle = hovered ? "rgba(230,224,214,0.14)" : "rgba(230,224,214,0.08)";
+  ctx.fillRect(b.x,b.y,b.w,b.h);
+  ctx.strokeStyle="rgba(230,224,214,0.20)";
+  ctx.strokeRect(b.x,b.y,b.w,b.h);
+  ctx.fillStyle="#e6e0d6";
+  ctx.font="16px ui-monospace, monospace";
+  ctx.fillText(b.label, b.x+12, b.y+27);
+}
+function drawSigil(){
+  const x=state.circle.x, y=state.circle.y, R=radiusPx();
+  ctx.save(); ctx.translate(x,y);
+  ctx.beginPath(); ctx.arc(0,0,R,0,Math.PI*2);
+  ctx.strokeStyle="#e6e0d6"; ctx.globalAlpha=0.85; ctx.lineWidth=2; ctx.stroke();
+  ctx.beginPath(); ctx.arc(0,0,Math.max(10,R-12),0,Math.PI*2);
+  ctx.globalAlpha=0.30; ctx.lineWidth=1; ctx.stroke();
+  ctx.globalAlpha=0.42; ctx.beginPath();
+  for(let i=0;i<6;i++){
+    const a=(i/6)*Math.PI*2;
+    ctx.moveTo(Math.cos(a)*(R-6), Math.sin(a)*(R-6));
+    ctx.lineTo(Math.cos(a+Math.PI)*(R-18), Math.sin(a+Math.PI)*(R-18));
+  }
+  ctx.lineWidth=1; ctx.stroke();
+  ctx.restore(); ctx.globalAlpha=1;
+}
+function drawSouls(){
+  const R=radiusPx(), R2=R*R, baseBindT=bindTime();
+  for(const s of state.souls){
+    if(s.dead) continue;
+    const inside = dist2(s.x,s.y,state.circle.x,state.circle.y) <= R2;
+    const t=ORB_TYPES[s.type];
+    let bindT = baseBindT * t.bindMult + (state.bindPenaltyT>0 ? 0.4 : 0);
+    const p = clamp(s.bound / bindT, 0, 1);
+
+    ctx.beginPath(); ctx.arc(s.x,s.y,s.r,0,Math.PI*2);
+    ctx.fillStyle=t.color; ctx.globalAlpha=inside?0.92:0.55; ctx.fill();
+
+    if(s.type==="mythic"){
+      ctx.beginPath(); ctx.arc(s.x,s.y,s.r+9,0,Math.PI*2);
+      ctx.strokeStyle="#b077ff"; ctx.globalAlpha=inside?0.28:0.14; ctx.lineWidth=2; ctx.stroke();
+    }
+
+    ctx.beginPath(); ctx.arc(s.x,s.y,s.r+4,-Math.PI/2,-Math.PI/2+p*Math.PI*2);
+    ctx.strokeStyle="#e6e0d6"; ctx.globalAlpha=inside?0.55:0.12; ctx.lineWidth=2; ctx.stroke();
+
+    if(s.weakPulse>0){
+      const q=s.weakPulse/0.18;
+      ctx.beginPath(); ctx.arc(s.x,s.y,s.r+14+(1-q)*10,0,Math.PI*2);
+      ctx.strokeStyle="#c58cff"; ctx.globalAlpha=0.35*q; ctx.lineWidth=3; ctx.stroke();
+    }
+    ctx.globalAlpha=1;
+  }
+}
+function drawHUD(){
+  ctx.fillStyle="#d7d2c9"; ctx.globalAlpha=0.92; ctx.font="14px ui-monospace, monospace";
+  ctx.fillText(`Runde: ${save.round}`, 14, 22);
+  ctx.fillText(`Zeit: ${state.timeLeft.toFixed(1)}s`, 14, 42);
+  ctx.fillText(`Punkte (Runde): ${state.soulsThisRound}`, 14, 62);
+  ctx.fillText(`Seelen (Bank): ${save.bankSouls}`, 14, 82);
+
+  ctx.globalAlpha=0.70;
+  ctx.fillText(`Radius L${save.upgrades.radius}: ${Math.round(radiusPx())}px`, 14, 110);
+  ctx.fillText(`Bindung L${save.upgrades.bind}: ${bindTime().toFixed(2)}s`, 14, 130);
+  ctx.fillText(`Essenz L${save.upgrades.essence}: Mythic ${save.upgrades.essence>=2 ? "bindbar" : "nicht würdig"}`, 14, 150);
+
+  // audio debug line (so you can see what's wrong without console)
+  ctx.globalAlpha=0.55;
+  ctx.fillText(`Audio: unlock=${audioStatus.unlocked?"ja":"nein"} | menu=${audioStatus.menu} | round=${audioStatus.round}`, 14, 175);
+  ctx.globalAlpha=1;
+
+  if(state.ui.toastT>0){
+    const q=state.ui.toastT/0.75;
+    ctx.globalAlpha=0.9*q;
+    ctx.fillStyle="#e6e0d6";
+    ctx.font="16px ui-monospace, monospace";
+    ctx.fillText(`⟦ ${state.ui.toastText} ⟧`, state.ui.toastX-120, state.ui.toastY-(1-q)*10);
+    ctx.globalAlpha=1;
+  }
+}
+  // innocents update (preview)
+  if(ritualCd>0) ritualCd = Math.max(0, ritualCd-dt);
+  for(const m of innocents){
+    m.t += dt;
+    m.vx += Math.sin(m.t*0.9)*12*dt;
+    m.vy += Math.cos(m.t*0.8)*12*dt;
+    m.x += m.vx*dt; m.y += m.vy*dt;
+    if(m.x<0||m.x>canvas.width){ m.vx*=-1; m.x=clamp(m.x,0,canvas.width); }
+    if(m.y<0||m.y>canvas.height){ m.vy*=-1; m.y=clamp(m.y,0,canvas.height); }
+
+    // eat souls (state.souls)
+    for(const s of state.souls){
+      if(s.dead) continue;
+      if(dist2(m.x,m.y,s.x,s.y) < 22*22){ s.dead=true; }
+    }
+  }
+
+
+function drawMenu(){
+  // Let It Consume inspired: lots of negative space, central sigil, bone title
+  drawBackground();
+
+  const t = performance.now()*0.001;
+
+  // subtle vignette
+  const grd = ctx.createRadialGradient(canvas.width*0.5, canvas.height*0.45, canvas.height*0.08,
+                                      canvas.width*0.5, canvas.height*0.45, canvas.height*0.85);
+  grd.addColorStop(0, "rgba(0,0,0,0)");
+  grd.addColorStop(1, "rgba(0,0,0,0.62)");
+  ctx.fillStyle = grd;
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  // central sigil (static in menu)
+  const cx = canvas.width*0.5, cy = canvas.height*0.46;
+  ctx.save();
+  ctx.globalAlpha = 0.14;
+  // temporarily position circle for drawSigil()
+  const ox = state.circle.x, oy = state.circle.y;
+  state.circle.x = cx; state.circle.y = cy;
+  drawSigil();
+  state.circle.x = ox; state.circle.y = oy;
+  ctx.restore();
+
+  // ---- Procedural bone title: "SIGIL" (unstable B-2)
+  function boneSeg(x,y,len,ang,phase){
+    const wob = Math.sin(t*0.22 + phase)*1.6;
+    const L = len + wob;
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(x,y);
+    ctx.lineTo(x + Math.cos(ang)*L, y + Math.sin(ang)*L);
+    ctx.stroke();
+    // subtle joint
+    ctx.beginPath();
+    ctx.arc(x,y,3.0,0,Math.PI*2);
+    ctx.stroke();
+  }
+
+  ctx.save();
+  ctx.strokeStyle = "#e8e1d6";
+  ctx.lineCap = "round";
+  ctx.globalAlpha = 0.92;
+
+  // layout letters with slight baseline drift
+  const startX = canvas.width*0.5 - 160;
+  const baseY  = canvas.height*0.25;
+  const letterW = 70;
+
+  // Each letter as a small cluster of bones (not a font) — readable but "wrong"
+  const letters = [
+    // S
+    [{dx:10,dy:2,len:26,ang:0.1,p:1},{dx:18,dy:16,len:22,ang:2.9,p:2},{dx:6,dy:28,len:26,ang:-0.05,p:3}],
+    // I
+    [{dx:20,dy:0,len:34,ang:Math.PI/2,p:4},{dx:10,dy:0,len:18,ang:0.0,p:5},{dx:10,dy:34,len:18,ang:0.0,p:6}],
+    // G
+    [{dx:16,dy:2,len:28,ang:0.0,p:7},{dx:16,dy:2,len:30,ang:Math.PI/2,p:8},{dx:16,dy:32,len:28,ang:0.0,p:9},{dx:34,dy:22,len:16,ang:0.0,p:10}],
+    // I
+    [{dx:20,dy:0,len:34,ang:Math.PI/2,p:11},{dx:10,dy:0,len:18,ang:0.0,p:12},{dx:10,dy:34,len:18,ang:0.0,p:13}],
+    // L
+    [{dx:16,dy:0,len:36,ang:Math.PI/2,p:14},{dx:16,dy:34,len:26,ang:0.0,p:15}],
+  ];
+
+  // draw letters with per-letter slow drift
+  for(let i=0;i<letters.length;i++){
+    const driftX = Math.sin(t*0.09 + i*1.7)*1.2;
+    const driftY = Math.sin(t*0.07 + i*2.1)*1.0;
+    const x0 = startX + i*letterW + driftX;
+    const y0 = baseY + driftY + Math.sin(t*0.04 + i)*2.0;
+    for(const seg of letters[i]){
+      boneSeg(x0+seg.dx, y0+seg.dy, seg.len, seg.ang + Math.sin(t*0.03+i)*0.03, seg.p);
+    }
+  }
+
+  ctx.restore();
+
+  // subtitle
+  ctx.globalAlpha=0.68;
+  ctx.fillStyle="#e6e0d6";
+  ctx.font="13px ui-monospace, monospace";
+  ctx.fillText("Ein Kreis. Ein Urteil.", canvas.width/2-86, canvas.height*0.25 + 70);
+  ctx.globalAlpha=1;
+
+  // Buttons
+  for(const b of uiButtons) drawButton(b);
+
+  // tiny audio status
+  ctx.globalAlpha=0.50; ctx.font="12px ui-monospace, monospace";
+  ctx.fillText(`Audio: menu=${audioStatus.menu} | round=${audioStatus.round}`, 14, canvas.height-14);
+  ctx.globalAlpha=1;
+}
+
+function drawOptions(){
+  drawBackground();
+  ctx.fillStyle="#e6e0d6"; ctx.font="24px ui-monospace, monospace";
+  ctx.fillText("OPTIONEN", canvas.width/2-76, 140);
+
+  const cx=canvas.width/2, left=cx-220, top=canvas.height/2-90;
+  ctx.font="14px ui-monospace, monospace"; ctx.globalAlpha=0.85;
+  ctx.fillText(`Musik Lautstärke: ${(settings.musicVolume*100|0)}%`, left+70, top+24);
+  ctx.fillText(`SFX Lautstärke:   ${(settings.sfxVolume*100|0)}%`, left+70, top+76);
+  ctx.fillText(`Musik: ${settings.musicEnabled?"AN":"AUS"}`, left, top+2*52+16);
+  ctx.fillText(`SFX:   ${settings.sfxEnabled?"AN":"AUS"}`, left, top+2*52+66);
+  ctx.fillText(`Mute:  ${settings.muteAll?"AN":"AUS"}`, left, top+2*52+116);
+  ctx.globalAlpha=1;
+
+  for(const b of uiButtons) drawButton(b);
+}
+
+function drawUpgrade(){
+  drawBackground();
+  drawSouls(); drawSigil(); drawHUD();
+  ctx.fillStyle="rgba(0,0,0,0.72)"; ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  const panelW=760, panelH=560, px=(canvas.width-panelW)/2, py=(canvas.height-panelH)/2;
+  ctx.fillStyle="rgba(18,18,24,0.92)"; ctx.fillRect(px,py,panelW,panelH);
+  ctx.strokeStyle="rgba(230,224,214,0.18)"; ctx.strokeRect(px,py,panelW,panelH);
+
+  ctx.fillStyle="#e6e0d6"; ctx.font="20px ui-monospace, monospace";
+  ctx.fillText("KNOTEN — SIGIL VERSTÄRKEN", px+22, py+40);
+  ctx.font="13px ui-monospace, monospace"; ctx.globalAlpha=0.82;
+  ctx.fillText(`Bank-Seelen: ${save.bankSouls}`, px+22, py+66);
+  ctx.fillText(`Mythic: ${save.upgrades.essence>=2 ? "würdig" : "nicht würdig"}`, px+22, py+86);
+  ctx.globalAlpha=1;
+
+  // pentagram tree
+  const cx = px + panelW/2;
+  const cy = py + panelH/2 - 18;
+  drawPentagramTree(cx, cy, 185);
+
+  ctx.globalAlpha=0.60; ctx.font="12px ui-monospace, monospace";
+  ctx.fillText("Klicke auf einen Knoten, um zu kaufen.", px+22, py+panelH-100);
+  if(state.ui.msg){
+    ctx.globalAlpha=0.85;
+    ctx.fillText(state.ui.msg, px+22, py+panelH-78);
+  }
+  ctx.globalAlpha=1;
+
+  for(const b of uiButtons) drawButton(b);
+}
+
+
+let last = performance.now();
+function loop(now){
+  resizeCanvas();
+  const dt = Math.min(0.033, (now-last)/1000);
+  last = now;
+
+  update(dt);
+
+  if(state.screen==="MENU") drawMenu();
+  else if(state.screen==="OPTIONS") drawOptions();
+  else {
+    if(state.phase==="ROUND"){ drawBackground(); drawSouls(); drawSigil(); drawHUD();
+    // draw innocents (preview)
+    for(const m of innocents){
+      ctx.globalAlpha = 0.85;
+      ctx.fillStyle = "rgba(230,224,214,0.65)";
+      ctx.beginPath(); ctx.arc(m.x,m.y,9,0,Math.PI*2); ctx.fill();
+      ctx.globalAlpha = 0.20;
+      ctx.strokeStyle = "rgba(197,140,255,0.55)";
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(m.x,m.y,14,0,Math.PI*2); ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    // essence/karma feedback (preview overlays)
+    const fe = freeEssence();
+    if(fe<=1){
+      ctx.globalAlpha = 0.10 + (1-fe)*0.10;
+      ctx.fillStyle = "rgba(255,60,60,1)";
+      ctx.fillRect(0,0,canvas.width,canvas.height);
+      ctx.globalAlpha = 1;
+    }
+    const k = karmaLevel();
+    if(k>0){
+      ctx.globalAlpha = Math.min(0.18, 0.05 + k*0.02);
+      ctx.fillStyle = "rgba(160,100,255,1)";
+      ctx.fillRect(0,0,canvas.width,canvas.height);
+      ctx.globalAlpha = 1;
+    }
+    if(ritualCd>0){
+      ctx.globalAlpha=0.55;
+      ctx.fillStyle="#e6e0d6";
+      ctx.font="12px ui-monospace, monospace";
+      ctx.fillText(`Ritual: ${ritualCd.toFixed(0)}s`, 14, canvas.height-28);
+      ctx.globalAlpha=1;
+    }
+ }
+    else drawUpgrade();
+  }
+
+  requestAnimationFrame(loop);
+}
+
+// boot
+goMenu();
+
+  // flash overlay (preview)
+  if(state.ui.flashT>0){
+    ctx.globalAlpha = Math.min(0.55, state.ui.flashT);
+    ctx.fillStyle = "rgba(255,40,40,1)";
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.globalAlpha = 1;
+    state.ui.flashT = Math.max(0, state.ui.flashT - dt);
+  }
+requestAnimationFrame(loop);
